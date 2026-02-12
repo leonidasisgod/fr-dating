@@ -1,0 +1,8 @@
+streamlit
+openai
+numpy
+python-dotenv
+faiss-cpu
+rank_bm25
+geopy
+pydantic
