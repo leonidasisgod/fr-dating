@@ -1,6 +1,8 @@
 import faiss
 import numpy as np
 import math
+import pickle
+import os
 from rank_bm25 import BM25Okapi
 
 
@@ -15,7 +17,7 @@ def calculate_distance(lat1, lon1, lat2, lon2):
 
 
 def check_deal_breakers(user, candidate):
-    """Проверяет, нет ли в профиле кандидата вещей, которые юзер не приемлет."""
+    """Проверяет критические несовместимости."""
     cand_content = (
             candidate.bio + " " +
             " ".join(candidate.lifestyle) + " " +
@@ -29,77 +31,103 @@ def check_deal_breakers(user, candidate):
 
 
 class VectorIndex:
-    def __init__(self, dim: int):
+    def __init__(self, dim: int = 1536):
         self.dim = dim
         self.profiles = []
-        self.embeddings = None  # Храним для ручного скоринга на малых выборках
+        self.embeddings = None
         self.bm25 = None
+        self.index = faiss.IndexFlatIP(dim)
 
     def add(self, vectors: np.ndarray, profiles: list):
-        """Добавляет профили и настраивает текстовый поиск."""
+        """Загружает данные в индекс."""
+        # Приводим к float32 — это 'родной' тип для FAISS и numpy-операций
+        vectors = np.ascontiguousarray(vectors).astype('float32')
         faiss.normalize_L2(vectors)
+
         self.embeddings = vectors
         self.profiles = profiles
+        self.index.add(vectors)
 
-        # Подготовка BM25 (по био, ценностям и целям)
+        # Инициализация BM25
         corpus = [
             (p.bio + " " + " ".join(p.values) + " " + " ".join(p.goals)).lower().split()
             for p in profiles
         ]
         self.bm25 = BM25Okapi(corpus)
 
-    def search_hybrid(self, me, me_emb, max_km=2000, k=5, alpha=0.7):
-        """
-        Умный поиск с учетом гендерных предпочтений, дистанции и дилбрейкеров.
-        """
-        # Нормализуем вектор запроса
-        faiss.normalize_L2(me_emb)
+    def save(self, folder="data/vector_db"):
+        """Сохраняет базу на диск, чтобы не платить за эмбеддинги снова."""
+        if not os.path.exists(folder):
+            os.makedirs(folder)
 
-        # Считаем BM25 для всех заранее
+        faiss.write_index(self.index, f"{folder}/index.faiss")
+        with open(f"{folder}/meta.pkl", "wb") as f:
+            pickle.dump({
+                "profiles": self.profiles,
+                "embeddings": self.embeddings,
+                "bm25": self.bm25
+            }, f)
+        print(f"✅ База сохранена в {folder}")
+
+    def load(self, folder="data/vector_db"):
+        """Загружает базу с диска."""
+        if os.path.exists(f"{folder}/index.faiss"):
+            self.index = faiss.read_index(f"{folder}/index.faiss")
+            with open(f"{folder}/meta.pkl", "rb") as f:
+                data = pickle.load(f)
+                self.profiles = data["profiles"]
+                self.embeddings = data["embeddings"]
+                self.bm25 = data["bm25"]
+            return True
+        return False
+
+    def search_hybrid(self, me, me_emb, max_km=2000, k=5, alpha=0.7):
+        """Гибридный поиск с защитой от ошибок типов."""
+        if self.embeddings is None:
+            return []
+
+        # ПОДГОТОВКА ЗАПРОСА
+        # Превращаем me_emb в чистый float32 вектор (1D)
+        query_vec = np.array(me_emb).flatten().astype('float32')
+        # Нормализация для косинусного сходства
+        norm = np.linalg.norm(query_vec)
+        if norm > 0:
+            query_vec = query_vec / norm
+
+        # Считаем BM25
         tokenized_query = (me.bio + " " + " ".join(me.values)).lower().split()
         bm25_scores = self.bm25.get_scores(tokenized_query)
-        if np.max(bm25_scores) > 0:
-            bm25_scores = bm25_scores / np.max(bm25_scores)
+        max_bm25 = np.max(bm25_scores)
+        if max_bm25 > 0:
+            bm25_scores = bm25_scores / max_bm25
 
         results = []
 
         for idx, candidate in enumerate(self.profiles):
-            # --- HARD FILTERS ---
+            # --- ФИЛЬТРЫ ---
+            if candidate.id == me.id: continue
 
-            # 1. Исключаем себя
-            if candidate.id == me.id:
-                continue
-
-            # 2. МУЖСКОЙ/ЖЕНСКИЙ ФИЛЬТР (Взаимная совместимость)
-            # Подходит ли кандидат мне?
+            # Гендерный фильтр
             me_compatible = (me.preferred_gender == "all" or me.preferred_gender == candidate.gender)
-            # Подхожу ли я кандидату?
             cand_compatible = (candidate.preferred_gender == "all" or candidate.preferred_gender == me.gender)
+            if not (me_compatible and cand_compatible): continue
 
-            if not (me_compatible and cand_compatible):
-                continue
-
-            # 3. ГЕО ФИЛЬТР
+            # Гео фильтр
             dist = calculate_distance(me.lat, me.lon, candidate.lat, candidate.lon)
-            if dist > max_km:
-                continue
+            if dist > max_km: continue
 
-            # 4. DEAL-BREAKERS
-            if check_deal_breakers(me, candidate):
-                continue
+            # Deal-breakers
+            if check_deal_breakers(me, candidate): continue
 
-            # --- SOFT SCORING ---
+            # --- СКОРИНГ ---
+            # Векторное сходство (теперь без ошибок размерности)
+            cand_vec = self.embeddings[idx].astype('float32')
+            v_score = float(np.dot(query_vec, cand_vec))
 
-            # Векторное сходство (Cosine Similarity)
-
-
-            # .flatten() гарантирует, что оба вектора — просто списки чисел одинаковой длины
-            v_score = float(np.dot(me_emb.flatten(), self.embeddings[idx].flatten()))
-
-            # Текстовое сходство (BM25)
+            # Текстовое сходство
             kw_score = float(bm25_scores[idx])
 
-            # Гибридный результат
+            # Итоговый гибрид
             final_score = (alpha * v_score) + ((1 - alpha) * kw_score)
 
             results.append({
@@ -112,6 +140,5 @@ class VectorIndex:
                 }
             })
 
-        # Сортировка по убыванию и возврат топ-K
         results.sort(key=lambda x: x['score'], reverse=True)
         return results[:k]
