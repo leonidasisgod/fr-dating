@@ -91,6 +91,8 @@ class VectorIndex:
             # --- SOFT SCORING ---
 
             # Векторное сходство (Cosine Similarity)
+
+
             # .flatten() гарантирует, что оба вектора — просто списки чисел одинаковой длины
             v_score = float(np.dot(me_emb.flatten(), self.embeddings[idx].flatten()))
 
